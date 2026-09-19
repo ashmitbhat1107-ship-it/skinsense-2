@@ -998,3 +998,1137 @@
   buildSkinGrid(skinGrid, 'skinType', 'III');
 
   function getSelected(container, name){
+    var checked = container.querySelector('input[name="'+name+'"]:checked');
+    return checked ? checked.value : 'III';
+  }
+
+  // ---------- App state ----------
+  var state = {
+    email: '',
+    name: 'Ananya Sharma',
+    age: 24,
+    skinType: 'III',
+    allergy: '',
+    outdoor: '30 minutes – 2 hours',
+    uvIndex: null,     // no fabricated default — null until a real reading exists
+    readings: [],      // {t: Date, source: 'simulator'|'device', voltage, intensity, uvIndex}
+    alerts: []          // {t: Date, msg, level}
+  };
+
+  // Persistent offline account vault. Each browser has its own local encrypted
+  // password verifier and user records, keyed by email. A real cloud database
+  // must be provided by a server; never put a shared database credential in HTML.
+  var STORAGE_KEY = 'skinsense-offline-vault-v2';
+  var usersDB = loadVault();
+
+  function loadVault(){
+    try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'); }
+    catch(e) { return {}; }
+  }
+  function persistVault(){
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(usersDB)); }
+    catch(e) { alert('Device storage is full or unavailable. Your latest changes have not been saved. Download a profile file to keep a backup.'); }
+  }
+  async function passwordHash(value){
+    if (window.crypto && window.crypto.subtle){
+      var bytes = new TextEncoder().encode(value);
+      var digest = await crypto.subtle.digest('SHA-256', bytes);
+      return Array.prototype.map.call(new Uint8Array(digest), function(b){ return b.toString(16).padStart(2,'0'); }).join('');
+    }
+    return 'legacy-' + value; // only for older browsers without Web Crypto
+  }
+  function hydrateRecord(record){
+    var saved = record.data || record;
+    Object.assign(state, saved);
+    state.photo = saved.photo || ''; state.temperature = saved.temperature == null ? null : saved.temperature;
+    state.temperatureSource = saved.temperatureSource || ''; state.chats = saved.chats || [];
+    state.readings = (state.readings || []).map(function(r){ r.t = new Date(r.t); return r; });
+    state.alerts = (state.alerts || []).map(function(a){ a.t = new Date(a.t); return a; });
+  }
+
+  function snapshotState(){
+    return {
+      name: state.name, age: state.age, skinType: state.skinType,
+      allergy: state.allergy, outdoor: state.outdoor,
+      uvIndex: state.uvIndex, lastSunscreenAt: state.lastSunscreenAt || null,
+      photo: state.photo || '', temperature: state.temperature == null ? null : state.temperature,
+      temperatureSource: state.temperatureSource || '', chats: state.chats || [],
+      readings: state.readings.slice(), alerts: state.alerts.slice()
+    };
+  }
+  function saveCurrentUser(){
+    if (state.email && usersDB[state.email]) { usersDB[state.email].data = snapshotState(); persistVault(); }
+  }
+
+  // ---------- Tabs ----------
+  var tabs = document.querySelectorAll('.tab');
+  var signupForm = document.getElementById('signup-form');
+  var signinForm = document.getElementById('signin-form');
+  var switchNote = document.getElementById('switch-note');
+
+  function setTab(which){
+    tabs.forEach(function(t){ t.classList.toggle('active', t.dataset.tab === which); });
+    signupForm.classList.toggle('hidden', which !== 'signup');
+    signinForm.classList.toggle('hidden', which !== 'signin');
+    switchNote.innerHTML = which === 'signup'
+      ? 'Already have an account? <button type="button" id="to-signin">Sign in</button>'
+      : 'New to SkinSense? <button type="button" id="to-signup">Create an account</button>';
+    var btn = switchNote.querySelector('button');
+    btn.addEventListener('click', function(){ setTab(which === 'signup' ? 'signin' : 'signup'); });
+  }
+  tabs.forEach(function(t){ t.addEventListener('click', function(){ setTab(t.dataset.tab); }); });
+  document.getElementById('to-signin').addEventListener('click', function(){ setTab('signin'); });
+
+  // ---------- Auth submit ----------
+  document.getElementById('signup-form').addEventListener('submit', async function(e){
+    e.preventDefault();
+    var email = document.getElementById('su-email').value.trim().toLowerCase();
+    if (usersDB[email]) {
+      setTab('signin');
+      document.getElementById('si-email').value = email;
+      alert('An account already exists for this email. Please sign in with your password.');
+      return;
+    } else {
+      state.email = email;
+      state.name = document.getElementById('su-name').value.trim() || 'Friend';
+      state.age = document.getElementById('su-age').value || '—';
+      state.skinType = getSelected(skinGrid, 'skinType');
+      state.allergy = document.getElementById('su-allergy').value.trim();
+      state.outdoor = document.getElementById('su-outdoor').value;
+      state.readings = [];
+      state.alerts = [];
+      state.lastSunscreenAt = null;
+      state.uvIndex = null; state.photo = ''; state.temperature = null; state.temperatureSource = ''; state.chats = [];
+      usersDB[email] = {passwordHash: await passwordHash(document.getElementById('su-password').value), data:snapshotState()};
+    }
+    saveCurrentUser();
+    enterDashboard();
+  });
+
+  document.getElementById('signin-form').addEventListener('submit', async function(e){
+    e.preventDefault();
+    var email = document.getElementById('si-email').value.trim().toLowerCase();
+    if (usersDB[email]) {
+      var expected = usersDB[email].passwordHash;
+      if (expected !== await passwordHash(document.getElementById('si-password').value)) { alert('That password does not match this SkinSense account.'); return; }
+      state.email = email;
+      hydrateRecord(usersDB[email]);
+    } else {
+      alert('We could not find an account for that email on this device. Create an account first.');
+      setTab('signup');
+      return;
+    }
+    saveCurrentUser();
+    enterDashboard();
+  });
+
+  // ---------- Dashboard population ----------
+  function skinInfo(id){
+    for (var i=0;i<skinTypes.length;i++){ if (skinTypes[i].id === id) return skinTypes[i]; }
+    return skinTypes[2];
+  }
+
+  function timeOfGreeting(){
+    var h = new Date().getHours();
+    if (h < 12) return 'Good morning';
+    if (h < 17) return 'Good afternoon';
+    return 'Good evening';
+  }
+
+  function firstName(full){
+    return (full || '').split(' ')[0] || 'there';
+  }
+
+  // WHO / EPA standard UV Index risk categories.
+  function uvCategory(uv){
+    if (uv >= 11) return {key:'extreme',  label:'Extreme exposure risk',   color:'#6B3FA0'};
+    if (uv >= 8)  return {key:'veryhigh', label:'Very high exposure risk', color:'#A62639'};
+    if (uv >= 6)  return {key:'high',     label:'High exposure risk',      color:'#C1443C'};
+    if (uv >= 3)  return {key:'moderate', label:'Moderate exposure risk',  color:'#F2A541'};
+    return               {key:'low',      label:'Low exposure risk',       color:'#2E8B74'};
+  }
+
+  function renderRecommendation(){
+    var pill = document.getElementById('risk-pill');
+    var label = document.getElementById('risk-label');
+    var recText = document.getElementById('rec-text');
+    var recCaveat = document.getElementById('rec-caveat');
+    pill.className = 'risk-pill';
+
+    if (state.uvIndex === null || state.uvIndex === undefined){
+      document.getElementById('uv-number').textContent = '–';
+      pill.classList.add('none');
+      label.textContent = 'No reading yet';
+      recText.className = 'no-reading';
+      recText.textContent = 'Connect your device or turn on the circuit simulator below to get a live, personalized reading.';
+      recCaveat.classList.add('hidden');
+      document.getElementById('gauge-arc').style.strokeDashoffset = 389.6;
+      return;
+    }
+
+    var uv = state.uvIndex;
+    var info = skinInfo(state.skinType);
+    var cat = uvCategory(uv);
+    document.getElementById('uv-number').textContent = uv.toFixed ? uv.toFixed(1) : uv;
+    pill.classList.add(cat.key === 'high' ? 'high' : cat.key);
+    label.textContent = cat.label;
+
+    recCaveat.classList.remove('hidden');
+    recText.className = '';
+    if (uv < 0.5){
+      recText.innerHTML = 'No meaningful UV detected right now — no burn-time estimate needed.';
+    } else {
+      // minutes = 0.667 x MED(J/m^2) / UV Index — derived from the WHO/WMO UV
+      // Index definition (UVI = 40 x erythemal irradiance in W/m^2) applied to
+      // published Fitzpatrick MED values. Individual response varies ±20%.
+      var minutes = Math.round(0.667 * info.med / uv);
+      recText.innerHTML = 'Based on your skin type, unprotected skin may start reddening in roughly <strong>' + minutes + ' minutes</strong> of continuous exposure at this UV level.';
+    }
+
+    var circumference = 389.6;
+    var pct = Math.min(uv / 15, 1);
+    var offset = circumference * (1 - pct);
+    document.getElementById('gauge-arc').style.strokeDashoffset = offset;
+    document.getElementById('gauge-arc').setAttribute('stroke', cat.color);
+  }
+
+  function renderProfile(){
+    document.getElementById('topbar-name').textContent = firstName(state.name);
+    document.getElementById('avatar-initial').textContent = (state.name || 'S').trim().charAt(0).toUpperCase();
+    document.getElementById('greet-text').textContent = timeOfGreeting() + ', ' + firstName(state.name);
+
+    document.getElementById('pv-name').textContent = state.name;
+    document.getElementById('pv-age').textContent = state.age;
+    var info = skinInfo(state.skinType);
+    document.getElementById('pv-skin').textContent = 'Type ' + info.id + ' — ' + info.label;
+    document.getElementById('pv-allergy').textContent = state.allergy ? state.allergy : 'None listed';
+    document.getElementById('pv-outdoor').textContent = state.outdoor;
+  }
+
+  // Only real recorded readings are ever drawn here — no fabricated fill data.
+  var historyMode = 'hour';
+  function groupedReadings(){
+    var groups = {};
+    state.readings.forEach(function(r){
+      if (typeof r.uvIndex !== 'number' || !Number.isFinite(r.uvIndex)) return;
+      var d = new Date(r.t), key, label;
+      if (historyMode === 'week') { var monday = new Date(d); monday.setDate(d.getDate() - ((d.getDay()+6)%7)); monday.setHours(0,0,0,0); key = monday.getTime(); label = 'Week of ' + monday.toLocaleDateString([], {month:'short', day:'numeric'}); }
+      else if (historyMode === 'day') { d.setHours(0,0,0,0); key = d.getTime(); label = new Date(key).toLocaleDateString([], {weekday:'short', month:'short', day:'numeric'}); }
+      else { d.setMinutes(0,0,0); key = d.getTime(); label = new Date(key).toLocaleTimeString([], {hour:'numeric'}); }
+      if (!groups[key]) groups[key] = {t:new Date(Number(key)), label:label, total:0, count:0, uvIndex:0};
+      groups[key].total += r.uvIndex; groups[key].count++; groups[key].uvIndex = Math.max(groups[key].uvIndex, r.uvIndex);
+    });
+    return Object.keys(groups).map(function(k){ return groups[k]; }).sort(function(a,b){ return a.t-b.t; });
+  }
+  function renderReadings(){
+    var wrap = document.getElementById('chart-wrap');
+    var list = document.getElementById('readings-list');
+    wrap.innerHTML = '';
+    list.innerHTML = '';
+
+    if (!state.readings.length){
+      wrap.innerHTML = '<div class="readings-empty">No readings recorded yet — turn on the circuit simulator or connect a device to begin logging.</div>';
+      return;
+    }
+
+    var recent = groupedReadings().slice(-10);
+    var max = Math.max.apply(null, recent.map(function(r){ return r.uvIndex; }).concat([1]));
+    recent.forEach(function(r, i){
+      var col = document.createElement('div');
+      col.className = 'bar-col';
+      var barHeight = Math.max(4, Math.round((r.uvIndex / max) * 100));
+      var timeLabel = r.label;
+      col.innerHTML = '<div style="flex:1;display:flex;align-items:flex-end;width:100%;justify-content:center;">' +
+                       '<div class="bar' + (i === recent.length-1 ? ' today' : '') + '" style="height:'+barHeight+'%;" title="Highest UV Index ' + r.uvIndex.toFixed(1) + ' · ' + timeLabel + '"></div>' +
+                       '</div><span class="day">'+timeLabel+'</span>';
+      wrap.appendChild(col);
+    });
+
+    groupedReadings().slice(-6).reverse().forEach(function(r){
+      var row = document.createElement('div');
+      row.className = 'reading-row';
+      row.innerHTML = '<span>' + r.label + ' · highest UV ' + r.uvIndex.toFixed(1) + '</span>' +
+                       '<span class="t">' + r.count + ' reading' + (r.count === 1 ? '' : 's') + '</span>';
+      list.appendChild(row);
+    });
+  }
+
+  function enterDashboard(){
+    document.getElementById('view-auth').classList.add('hidden');
+    document.getElementById('view-dashboard').classList.remove('hidden');
+    renderProfile();
+    renderRecommendation();
+    renderReadings();
+    renderNotifications();
+    renderSunscreenStatus();
+    resetAiChat();
+  }
+
+  // Home is a curated at-a-glance view; each tab filters into a focused,
+  // less crowded view of the same saved information.
+  document.querySelectorAll('.dashboard-tab').forEach(function(tab){
+    tab.addEventListener('click', function(){
+      var view = tab.dataset.view;
+      document.querySelectorAll('.dashboard-tab').forEach(function(t){ t.classList.toggle('active', t === tab); });
+      document.querySelectorAll('[data-panel]').forEach(function(panel){
+        var tags = panel.dataset.panel.split(' ');
+        panel.classList.toggle('hidden', tags.indexOf(view) === -1);
+      });
+      document.getElementById('greet-sub').textContent = ({home:"Here's your skin-health snapshot for today.",protection:'Your sun-safety plan and live UV controls.',climate:'Real local conditions, pulled with your permission.',history:'Your saved exposure readings, grouped your way.',profile:'Your personal skin profile and preferences.'})[view];
+    });
+  });
+
+  var safetyModal = document.getElementById('safety-modal');
+  function showSafetyModal(title, message){
+    document.getElementById('safety-title').textContent = title;
+    document.getElementById('safety-message').textContent = message;
+    safetyModal.classList.remove('hidden');
+  }
+  function markSunscreenApplied(){
+    state.lastSunscreenAt = Date.now(); saveCurrentUser(); renderSunscreenStatus(); safetyModal.classList.add('hidden');
+    pushAlert('Sunscreen refresh recorded. Your next reminder is set for two hours from now.', 'info');
+  }
+  function renderSunscreenStatus(){
+    var at = state.lastSunscreenAt ? new Date(state.lastSunscreenAt) : null;
+    var due = at ? new Date(at.getTime() + 2 * 60 * 60 * 1000) : null;
+    var title = document.getElementById('sunscreen-title'), text = document.getElementById('sunscreen-text');
+    if (!due){ title.textContent = 'Sunscreen check-in'; text.textContent = 'Apply broad-spectrum SPF 30+ before heading outdoors.'; return; }
+    if (Date.now() >= due){ title.textContent = 'Sunscreen refresh due now'; text.textContent = 'Two hours have passed since your last check-in. Reapply, especially after swimming or sweating.'; }
+    else { title.textContent = 'Protection is on track'; text.textContent = 'Your next check-in is at ' + due.toLocaleTimeString([], {hour:'numeric', minute:'2-digit'}) + '.'; }
+  }
+  document.getElementById('apply-sunscreen-btn').addEventListener('click', markSunscreenApplied);
+  document.getElementById('safety-action').addEventListener('click', markSunscreenApplied);
+  document.getElementById('safety-dismiss').addEventListener('click', function(){ safetyModal.classList.add('hidden'); });
+  var sunscreenReminderShownFor = null;
+  setInterval(function(){
+    if (document.getElementById('view-dashboard').classList.contains('hidden') || !state.lastSunscreenAt) return;
+    var dueAt = Number(state.lastSunscreenAt) + 2 * 60 * 60 * 1000;
+    if (Date.now() >= dueAt && sunscreenReminderShownFor !== state.lastSunscreenAt){
+      sunscreenReminderShownFor = state.lastSunscreenAt;
+      pushAlert('Sunscreen refresh is due — two hours have passed since your last check-in.', 'high');
+      showSafetyModal('Time to reapply', 'It has been two hours since your last sunscreen check-in. Reapply SPF 30+ now; do it sooner after swimming, sweating, or towel drying.');
+      renderSunscreenStatus();
+    }
+  }, 60000);
+
+  document.querySelectorAll('[data-history]').forEach(function(button){
+    button.addEventListener('click', function(){
+      document.querySelectorAll('[data-history]').forEach(function(b){ b.classList.toggle('active', b === button); });
+      historyMode = button.dataset.history; renderReadings();
+      document.getElementById('history-note').textContent = 'Showing your saved readings by ' + button.dataset.history + '. New readings are kept with their exact time and date.';
+    });
+  });
+
+  document.getElementById('logout-btn').addEventListener('click', function(){
+    saveCurrentUser();
+    document.getElementById('view-dashboard').classList.add('hidden');
+    document.getElementById('view-auth').classList.remove('hidden');
+    resetDeviceUI();
+    closeNotifPanel();
+    closeAiPanel();
+  });
+
+  // ---------- Profile edit ----------
+  var editBtn = document.getElementById('edit-profile-btn');
+  var profileView = document.getElementById('profile-view');
+  var profileEditForm = document.getElementById('profile-edit-form');
+  var skinGridEdit = document.getElementById('skin-grid-edit');
+
+  editBtn.addEventListener('click', function(){
+    document.getElementById('pe-name').value = state.name;
+    document.getElementById('pe-age').value = state.age;
+    document.getElementById('pe-allergy').value = state.allergy;
+    document.getElementById('pe-outdoor').value = state.outdoor;
+    buildSkinGrid(skinGridEdit, 'skinTypeEdit', state.skinType);
+    profileView.classList.add('hidden');
+    profileEditForm.classList.remove('hidden');
+  });
+
+  document.getElementById('cancel-edit-btn').addEventListener('click', function(){
+    profileEditForm.classList.add('hidden');
+    profileView.classList.remove('hidden');
+  });
+
+  profileEditForm.addEventListener('submit', function(e){
+    e.preventDefault();
+    state.name = document.getElementById('pe-name').value.trim() || state.name;
+    state.age = document.getElementById('pe-age').value || state.age;
+    state.allergy = document.getElementById('pe-allergy').value.trim();
+    state.outdoor = document.getElementById('pe-outdoor').value;
+    state.skinType = getSelected(skinGridEdit, 'skinTypeEdit');
+    saveCurrentUser();
+    renderProfile();
+    renderRecommendation();
+    profileEditForm.classList.add('hidden');
+    profileView.classList.remove('hidden');
+  });
+
+  // ---------- Alerts / notifications ----------
+  var bellBtn = document.getElementById('bell-btn');
+  var notifPanel = document.getElementById('notif-panel');
+  var bellBadge = document.getElementById('bell-badge');
+  var unreadAlerts = 0;
+
+  function pushAlert(msg, level){
+    state.alerts.unshift({t:new Date(), msg:msg, level:level || 'info'});
+    if (state.alerts.length > 20) state.alerts.length = 20;
+    unreadAlerts++;
+    renderNotifications();
+    saveCurrentUser();
+  }
+
+  function renderNotifications(){
+    var list = document.getElementById('notif-list');
+    if (!state.alerts.length){
+      list.innerHTML = '<div class="notif-empty">No alerts yet — alerts appear here as real readings come in.</div>';
+    } else {
+      list.innerHTML = '';
+      state.alerts.forEach(function(a){
+        var item = document.createElement('div');
+        item.className = 'notif-item level-' + a.level;
+        item.innerHTML = '<span class="dot2"></span><div><div class="msg">' + a.msg + '</div><div class="time">' +
+          a.t.toLocaleTimeString([], {hour:'numeric', minute:'2-digit'}) + '</div></div>';
+        list.appendChild(item);
+      });
+    }
+    if (unreadAlerts > 0){
+      bellBadge.textContent = unreadAlerts > 9 ? '9+' : unreadAlerts;
+      bellBadge.classList.remove('hidden');
+    } else {
+      bellBadge.classList.add('hidden');
+    }
+  }
+
+  function closeNotifPanel(){ notifPanel.classList.add('hidden'); }
+
+  bellBtn.addEventListener('click', function(){
+    var willShow = notifPanel.classList.contains('hidden');
+    notifPanel.classList.toggle('hidden');
+    if (willShow){ unreadAlerts = 0; bellBadge.classList.add('hidden'); }
+  });
+  document.addEventListener('click', function(e){
+    if (!notifPanel.classList.contains('hidden') && !e.target.closest('.bell-wrap')) closeNotifPanel();
+  });
+
+  // ---------- Device connection ----------
+  var scanBtn = document.getElementById('scan-btn');
+  var scanBox = document.getElementById('scan-box');
+  var foundRow = document.getElementById('found-row');
+  var connectBtn = document.getElementById('connect-btn');
+  var deviceIdle = document.getElementById('device-idle');
+  var deviceConnected = document.getElementById('device-connected');
+  var statusDot = document.getElementById('status-dot');
+  var statusText = document.getElementById('status-text');
+  var disconnectBtn = document.getElementById('disconnect-btn');
+  var deviceIsConnected = false;
+
+  scanBtn.addEventListener('click', function(){
+    scanBtn.disabled = true;
+    scanBox.classList.remove('hidden');
+    foundRow.classList.add('hidden');
+    setTimeout(function(){
+      scanBox.classList.add('hidden');
+      foundRow.classList.remove('hidden');
+      scanBtn.disabled = false;
+    }, 1600);
+  });
+
+  connectBtn.addEventListener('click', function(){
+    deviceIdle.classList.add('hidden');
+    deviceConnected.classList.remove('hidden');
+    statusDot.classList.add('connected');
+    statusText.textContent = 'Connected';
+    deviceIsConnected = true;
+    pushAlert('Device "SkinSense Band — A13F" connected.', 'info');
+    updateConnectedReadout();
+  });
+
+  disconnectBtn.addEventListener('click', function(){
+    pushAlert('Device disconnected.', 'info');
+    resetDeviceUI();
+  });
+
+  function resetDeviceUI(){
+    deviceConnected.classList.add('hidden');
+    deviceIdle.classList.remove('hidden');
+    foundRow.classList.add('hidden');
+    scanBox.classList.add('hidden');
+    statusDot.classList.remove('connected');
+    statusText.textContent = 'Not connected';
+    deviceIsConnected = false;
+  }
+
+  function updateConnectedReadout(){
+    var liveEl = document.getElementById('live-reading');
+    if (!liveEl) return;
+    if (sensor.lastIntensity === null){
+      liveEl.textContent = 'No data yet';
+    } else {
+      liveEl.textContent = sensor.lastUvi.toFixed(1) + ' (UV Index)';
+    }
+  }
+
+  // ---------- Circuit simulator toggle ----------
+  var simToggleBtn = document.getElementById('sim-toggle-btn');
+  var simPanel = document.getElementById('sim-panel');
+  simToggleBtn.addEventListener('click', function(){
+    var willShow = simPanel.classList.contains('hidden');
+    simPanel.classList.toggle('hidden');
+    simToggleBtn.textContent = willShow ? 'Hide circuit simulator' : 'Open circuit simulator';
+  });
+
+  // ---------- UV light + ML8511 sensor model ----------
+  // Reference data (not fabricated):
+  //  - ROHM ML8511 datasheet: V_REF (dark) = 1.0V typ; V_O = 2.2V typ at 10 mW/cm^2 @365nm.
+  //    https://cdn.sparkfun.com/datasheets/Sensors/LightImaging/ML8511_3-8-13.pdf
+  //  - SparkFun ML8511 Hookup Guide firmware mapping, voltage -> approx UV Index:
+  //    https://learn.sparkfun.com/tutorials/ml8511-uv-sensor-hookup-guide/all
+  var lightToggle = document.getElementById('light-toggle');
+  var intensitySlider = document.getElementById('intensity-slider');
+  var lightStateLabel = document.getElementById('light-state-label');
+  var intensityValueEl = document.getElementById('intensity-value');
+  var outVoltageEl = document.getElementById('out-voltage');
+  var outIntensityEl = document.getElementById('out-intensity');
+  var outUviEl = document.getElementById('out-uvi');
+
+  var sensor = {
+    lightOn: false,
+    sliderIntensity: 0,     // mW/cm^2, as set by the slider
+    lastIntensity: null,    // effective mW/cm^2 (0 when light is off)
+    lastVoltage: 1.0,
+    lastUvi: 0,
+    history: [],            // {t, uvIndex} — used for the live graph
+    lastLoggedCategory: null
+  };
+
+  function mapFloat(x, inMin, inMax, outMin, outMax){
+    var v = (x - inMin) * (outMax - outMin) / (inMax - inMin) + outMin;
+    return Math.max(outMin, Math.min(outMax, v));
+  }
+
+  function computeSensor(){
+    var incidentIntensity = sensor.lightOn ? sensor.sliderIntensity : 0;
+    // Datasheet two-point typical calibration: 1.0V @ 0 mW/cm^2, 2.2V @ 10 mW/cm^2.
+    var voltage = 1.0 + incidentIntensity * ((2.2 - 1.0) / 10);
+    voltage = Math.max(0.95, Math.min(3.3, voltage));
+    // SparkFun hookup-guide firmware formula, applied to that voltage.
+    var uvi = mapFloat(voltage, 0.99, 2.8, 0, 15);
+
+    sensor.lastIntensity = incidentIntensity;
+    sensor.lastVoltage = voltage;
+    sensor.lastUvi = uvi;
+
+    outVoltageEl.textContent = voltage.toFixed(2) + ' V';
+    outIntensityEl.textContent = incidentIntensity.toFixed(1) + ' mW/cm²';
+    outUviEl.textContent = uvi.toFixed(1);
+
+    sensor.history.push({t:Date.now(), uvIndex:uvi});
+    if (sensor.history.length > 60) sensor.history.shift();
+    drawGraph();
+
+    state.uvIndex = uvi;
+    renderRecommendation();
+    updateConnectedReadout();
+    checkAlertThreshold(uvi);
+  }
+
+  function checkAlertThreshold(uvi){
+    var cat = uvCategory(uvi).key;
+    if (cat !== sensor.lastLoggedCategory && (cat === 'high' || cat === 'veryhigh' || cat === 'extreme')){
+      pushAlert('UV Index reached ' + uvi.toFixed(1) + ' (' + uvCategory(uvi).label.replace(' exposure risk','') + ') — reapply sunscreen or seek shade.', 'high');
+      showSafetyModal('High UV warning', 'UV Index is ' + uvi.toFixed(1) + '. Reapply SPF 30+ now, cover up, and seek shade where possible.');
+    }
+    sensor.lastLoggedCategory = cat;
+  }
+
+  function logReading(source){
+    if (sensor.lastIntensity === null) return;
+    state.readings.push({t:new Date(), source:source, voltage:sensor.lastVoltage, intensity:sensor.lastIntensity, uvIndex:sensor.lastUvi});
+    state.readings[state.readings.length-1].temperature = state.temperature == null ? null : state.temperature;
+    state.readings[state.readings.length-1].temperatureSource = state.temperatureSource || '';
+    renderReadings();
+    saveCurrentUser();
+  }
+
+  function drawGraph(){
+    var svg = document.getElementById('sim-graph');
+    var pts = sensor.history;
+    if (pts.length < 2){ svg.innerHTML = ''; return; }
+    var w = 600, h = 110, pad = 8;
+    var maxUv = 15;
+    var step = (w - pad*2) / (pts.length - 1);
+    var path = '';
+    pts.forEach(function(p, i){
+      var x = pad + i*step;
+      var y = h - pad - ((p.uvIndex / maxUv) * (h - pad*2));
+      path += (i === 0 ? 'M' : 'L') + x.toFixed(1) + ',' + y.toFixed(1) + ' ';
+    });
+    var last = pts[pts.length-1];
+    var lastX = pad + (pts.length-1)*step;
+    var lastY = h - pad - ((last.uvIndex / maxUv) * (h - pad*2));
+    svg.innerHTML =
+      '<line x1="' + pad + '" y1="' + (h-pad) + '" x2="' + (w-pad) + '" y2="' + (h-pad) + '" stroke="#E1E8EA" stroke-width="1"/>' +
+      '<path d="' + path + '" fill="none" stroke="#12768A" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>' +
+      '<circle cx="' + lastX.toFixed(1) + '" cy="' + lastY.toFixed(1) + '" r="4" fill="#F2A541"/>';
+  }
+
+  lightToggle.addEventListener('change', function(){
+    sensor.lightOn = lightToggle.checked;
+    lightStateLabel.textContent = 'UV light: ' + (sensor.lightOn ? 'ON' : 'OFF');
+    computeSensor();
+    logReading('simulator');
+    pushAlert('Simulated UV light turned ' + (sensor.lightOn ? 'ON' : 'OFF') + '.', 'info');
+  });
+
+  intensitySlider.addEventListener('input', function(){
+    sensor.sliderIntensity = parseFloat(intensitySlider.value);
+    intensityValueEl.textContent = sensor.sliderIntensity.toFixed(1) + ' mW/cm²';
+    computeSensor();
+  });
+  intensitySlider.addEventListener('change', function(){
+    logReading('simulator');
+  });
+
+  // ---------- AI assistant ----------
+  var aiFab = document.getElementById('ai-fab');
+  var aiPanel = document.getElementById('ai-panel');
+  var aiMessagesEl = document.getElementById('ai-messages');
+  var aiForm = document.getElementById('ai-form');
+  var aiInput = document.getElementById('ai-input');
+  var aiSendBtn = document.getElementById('ai-send-btn');
+  var aiHistory = []; // {role, content}
+
+  function resetAiChat(){
+    aiHistory = (state.chats || []).slice();
+    aiMessagesEl.innerHTML = '';
+    if (aiHistory.length) { aiHistory.forEach(function(m){ addAiBubble(m.role,m.content); }); return; }
+    addAiBubble('assistant', 'Hi ' + firstName(state.name) + ' — I’m Shweta, your skin guide. I can use your saved profile and current reading to offer practical sun-safety and skin-care guidance. What would you like to know?');
+  }
+
+  function addAiBubble(role, text, extraClass){
+    var div = document.createElement('div');
+    div.className = 'ai-msg ' + role + (extraClass ? ' ' + extraClass : '');
+    div.textContent = text;
+    aiMessagesEl.appendChild(div);
+    aiMessagesEl.scrollTop = aiMessagesEl.scrollHeight;
+    return div;
+  }
+
+  document.getElementById('ai-close-btn').addEventListener('click', closeAiPanel);
+  function closeAiPanel(){ aiPanel.classList.add('hidden'); }
+
+  aiFab.addEventListener('click', function(){
+    aiPanel.classList.toggle('hidden');
+  });
+
+  function localDataSummary(){
+    var info = skinInfo(state.skinType);
+    var lines = [];
+    lines.push('Name: ' + state.name + ', age ' + state.age + '.');
+    lines.push('Skin type: Fitzpatrick ' + info.id + ' (' + info.label + '), MED ≈ ' + info.med + ' J/m².');
+    lines.push('Allergies/sensitivities: ' + (state.allergy || 'none listed') + '.');
+    lines.push('Typical time outdoors: ' + state.outdoor + '.');
+    if (state.uvIndex !== null){
+      lines.push('Most recent recorded UV Index: ' + state.uvIndex.toFixed(1) + ' (' + uvCategory(state.uvIndex).label + ').');
+    } else {
+      lines.push('No live UV reading recorded yet this session.');
+    }
+    if (state.readings.length){
+      lines.push('Readings logged this session: ' + state.readings.length + '.');
+    }
+    if (state.alerts.length){
+      lines.push('Most recent alert: "' + state.alerts[0].msg + '".');
+    }
+    return lines.join(' ');
+  }
+
+  async function sendToAssistant(userText){
+    aiHistory.push({role:'user', content: userText});
+    var chatOwner = state.email, chatCopy = activeCopy, chatBuffer = aiHistory;
+    state.chats = chatBuffer; saveCurrentUser();
+    var thinkingBubble = addAiBubble('assistant', 'Thinking…', 'thinking');
+
+    var systemPrompt = 'You are Shweta, the SkinSense skin guide, embedded in a UV-exposure and skin-health companion app. ' +
+      'You have access to the user\'s locally-saved profile and session data below — use it to personalize your answer when relevant, but do not invent data that isn\'t given. ' +
+      'You can also use web search for things that need current information (weather, UV forecasts, product facts). ' +
+      'Be concise, warm, and practical. Do not give medical diagnoses; suggest seeing a dermatologist for anything that sounds like a skin condition. ' +
+      'Local data:\n' + localDataSummary();
+
+    try {
+      var response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-6",
+          max_tokens: 1000,
+          system: systemPrompt,
+          messages: aiHistory,
+          tools: [{ type: "web_search_20250305", name: "web_search" }]
+        })
+      });
+      var data = await response.json();
+      var text = (data.content || [])
+        .map(function(block){ return block.type === 'text' ? block.text : ''; })
+        .filter(Boolean)
+        .join('\n')
+        .trim();
+      if (!text) text = "I couldn't find a good answer for that just now — could you rephrase?";
+      thinkingBubble.remove();
+      chatBuffer.push({role:'assistant', content: text});
+      if (chatOwner === state.email && chatCopy === activeCopy) { addAiBubble('assistant', text); state.chats = chatBuffer; saveCurrentUser(); }
+      else if(chatCopy) { var destination=(fileVault[chatOwner]||[]).find(function(f){return f.id===chatCopy;});if(destination){destination.data.chats=chatBuffer;saveFiles();} }
+      else if(usersDB[chatOwner]) { usersDB[chatOwner].data.chats = chatBuffer; persistVault(); }
+    } catch (err){
+      thinkingBubble.remove();
+      if(chatOwner === state.email && chatCopy === activeCopy) addAiBubble('assistant', "I couldn't reach the assistant service just now. Please try again in a moment.");
+    }
+  }
+
+  aiForm.addEventListener('submit', function(e){
+    e.preventDefault();
+    var text = aiInput.value.trim();
+    if (!text) return;
+    addAiBubble('user', text);
+    aiInput.value = '';
+    aiSendBtn.disabled = true;
+    sendToAssistant(text).finally(function(){ aiSendBtn.disabled = false; aiInput.focus(); });
+  });
+
+  // Additional profile, environmental and portability tools share the existing UI.
+  var extraStyle = document.createElement('style');
+  extraStyle.textContent = '.extra-actions{display:flex;flex-wrap:wrap;gap:.5rem;margin:.8rem 0}.extra-actions button{border:1px solid var(--line);border-radius:8px;padding:.55rem .7rem;background:var(--teal-light);color:var(--navy);font:600 .85rem Inter,sans-serif}.photo-large{width:72px;height:72px;border-radius:50%;object-fit:cover;background:var(--teal-light)}.avatar{object-fit:cover;overflow:hidden}.avatar img{width:100%;height:100%;object-fit:cover}.stress-scale{display:grid;grid-template-columns:repeat(5,1fr);gap:4px;margin:1rem 0}.stress-scale span{padding:.65rem .15rem;text-align:center;border-radius:8px;font-size:.75rem;background:var(--off);border-bottom:4px solid var(--tone);opacity:.65}.stress-scale span.selected{background:var(--tone);color:white;opacity:1;font-weight:700}.extra-card{margin-top:1.4rem}.extra-card input,.extra-card select{max-width:100%;padding:.55rem;border:1px solid var(--line);border-radius:7px;font:inherit}.file-entry{border-top:1px solid var(--line);padding:.8rem 0;overflow-wrap:anywhere}.extra-status{font-size:.85rem;line-height:1.5;color:var(--teal);overflow-wrap:anywhere}.camera-dialog{max-width:480px;width:95%;border:1px solid var(--line);border-radius:16px;padding:1.2rem}.camera-dialog::backdrop{background:#0b2e4580}.camera-dialog video{width:100%;border-radius:10px}.share-output{width:100%;min-height:90px;overflow-wrap:anywhere}.extra-card label{display:block;font-size:.85rem;margin:.6rem 0}.extra-card h4{margin-bottom:.6rem}';
+  document.head.appendChild(extraStyle);
+  function el(id){return document.getElementById(id);}
+  function extraCard(parent,id,html){var node=document.createElement('div');node.id=id;node.className='card extra-card';node.innerHTML=html;parent.appendChild(node);return node;}
+  var environmentCard = extraCard(document.querySelector('.col-main'),'environment-card', '<h3>Temperature & skin stress</h3><p class="sub">Ambient temperature around you, not body temperature.</p><label for="ambient-temp">Temperature: <strong id="ambient-value">No reading</strong></label><input id="ambient-temp" type="range" min="-15" max="70" step="1" value="22" style="width:100%"><div class="extra-actions"><button id="record-temp">Record manual temperature</button></div><p class="hint" id="temp-source">Move the control, then record. Range −15°C to 70°C.</p><h4 id="stress-result" aria-live="polite">Waiting for UV and temperature</h4><div class="stress-scale" id="stress-scale"></div><p class="hint">Illustrative exposure rating, not a clinical skin measurement. Uses the latest UV and ambient temperature; humidity, duration and individual response are not measured. A positive label does not guarantee safety.</p><p class="hint" id="stress-detail"></p>');
+  environmentCard.dataset.panel='protection';
+  var simTemp=document.createElement('div');simTemp.className='simlab-block';simTemp.innerHTML='<h5>SIMULATED AMBIENT TEMPERATURE</h5><label for="sim-temp">Temperature: <strong id="sim-temp-value">22°C</strong></label><input id="sim-temp" type="range" min="-15" max="70" step="1" value="22" style="width:100%;margin-top:.7rem"><p class="hint">Changing this control records simulated temperature alongside the current simulated UV.</p>';
+  document.querySelector('.simlab-row').appendChild(simTemp);
+  var photoUI=document.createElement('div');photoUI.innerHTML='<img id="profile-photo" class="photo-large hidden" alt="Your profile photo"><div class="extra-actions"><button id="choose-photo">Upload photo</button><button id="take-photo">Use camera</button><button id="remove-photo">Remove photo</button></div><input id="photo-file" type="file" accept="image/jpeg,image/png,image/webp" hidden><p class="extra-status" id="photo-status" role="status"></p>';
+  el('profile-view').prepend(photoUI);
+  var photoDialog=document.createElement('dialog');photoDialog.className='camera-dialog';photoDialog.innerHTML='<h3>Take your profile photo</h3><video id="camera-preview" autoplay playsinline muted></video><div class="extra-actions"><button id="capture-photo">Use this photo</button><button id="cancel-camera">Cancel</button></div>';document.body.appendChild(photoDialog);
+  var cameraStream=null;
+  function stopCamera(){if(cameraStream)cameraStream.getTracks().forEach(function(t){t.stop();});cameraStream=null;el('camera-preview').srcObject=null;}
+  photoDialog.addEventListener('close',stopCamera);
+  el('cancel-camera').onclick=function(){photoDialog.close();};
+  el('choose-photo').onclick=function(){el('photo-file').click();};
+  function setPhotoFromImage(image){var canvas=document.createElement('canvas');canvas.width=canvas.height=256;var w=image.videoWidth||image.naturalWidth,h=image.videoHeight||image.naturalHeight;if(!w||!h)throw Error('Camera is not ready yet.');var side=Math.min(w,h);canvas.getContext('2d').drawImage(image,(w-side)/2,(h-side)/2,side,side,0,0,256,256);state.photo=canvas.toDataURL('image/jpeg',.82);saveCurrentUser();renderExtras();}
+  el('photo-file').onchange=async function(){var file=this.files[0];if(!file)return;try{if(!/^image\/(jpeg|png|webp)$/.test(file.type)||file.size>10000000)throw Error('Choose a JPG, PNG or WebP photo smaller than 10 MB.');var url=URL.createObjectURL(file),img=new Image();try{img.src=url;await img.decode();setPhotoFromImage(img);el('photo-status').textContent='Photo saved to this profile.';}finally{URL.revokeObjectURL(url);}}catch(e){el('photo-status').textContent=e.message;}this.value='';};
+  el('take-photo').onclick=async function(){try{if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia)throw Error('Camera access needs a supported browser and secure page. You can upload a photo instead.');cameraStream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user'},audio:false});el('camera-preview').srcObject=cameraStream;photoDialog.showModal();}catch(e){stopCamera();el('photo-status').textContent='Camera unavailable or permission denied. '+e.message;}};
+  el('capture-photo').onclick=function(){try{setPhotoFromImage(el('camera-preview'));photoDialog.close();}catch(e){el('photo-status').textContent=e.message;}};
+  el('remove-photo').onclick=function(){state.photo='';saveCurrentUser();renderExtras();};
+  window.addEventListener('pagehide',stopCamera);
+  var stressLabels=['Very bad','Bad','Good','Amazing','Sublime'],stressColors=['#ae3145','#bf6413','#487a34','#137a79','#3465a8'];
+  function stressIndex(uv,temp){if(uv==null||temp==null)return -1;var u=uv>=11?0:uv>=6?1:uv>=3?2:uv>=1?3:4;var t=temp<=0||temp>=40?0:temp<10||temp>=32?1:temp<16||temp>=28?2:temp<20||temp>=26?3:4;return Math.min(u,t);}
+  function recordTemperature(source){state.temperature=Number(el(source==='simulator'?'sim-temp':'ambient-temp').value);state.temperatureSource=source;if(source==='simulator'){sensor.sliderIntensity=Number(intensitySlider.value);sensor.lightOn=lightToggle.checked;computeSensor();logReading('simulator');}else{state.readings.push({t:new Date(),source:'manual',uvIndex:state.uvIndex,temperature:state.temperature,temperatureSource:source});saveCurrentUser();renderReadings();}renderExtras();}
+  el('ambient-temp').oninput=function(){el('ambient-value').textContent=this.value+'°C (not recorded)';};
+  el('record-temp').onclick=function(){recordTemperature('manual');};
+  el('sim-temp').oninput=function(){el('sim-temp-value').textContent=this.value+'°C';};
+  el('sim-temp').onchange=function(){recordTemperature('simulator');};
+  var tipsCard=extraCard(document.querySelector('.col-side'),'personal-tips','<h3>Five tips for you</h3><div id="personal-tip-list" class="tip-grid"></div><p class="hint">Guidance: <a href="https://www.aad.org/public/everyday-care/sun-protection/shade-clothing-sunscreen/practice-safe-sun" target="_blank" rel="noopener">AAD sun protection</a> · <a href="https://www.cdc.gov/niosh/heat-stress/about/illnesses.html" target="_blank" rel="noopener">CDC heat</a> · <a href="https://www.cdc.gov/winter-weather/prevention/preventing-frostbite.html" target="_blank" rel="noopener">CDC cold</a></p>');tipsCard.dataset.panel='protection';
+  function renderExtras(){
+    var photo=state.photo||'';el('profile-photo').classList.toggle('hidden',!photo);if(photo)el('profile-photo').src=photo;else el('profile-photo').removeAttribute('src');
+    var avatar=el('avatar-initial');avatar.textContent=firstName(state.name).charAt(0).toUpperCase();if(photo){var img=document.createElement('img');img.src=photo;img.alt='Profile';avatar.replaceChildren(img);}
+    el('ambient-value').textContent=state.temperature==null?'No reading':state.temperature+'°C';el('temp-source').textContent=state.temperature==null?'Record a manual or simulated ambient temperature.':'Last temperature source: '+state.temperatureSource+'. Physical sensor pairing in this app is a demo.';
+    var idx=stressIndex(state.uvIndex,state.temperature);el('stress-result').textContent=idx<0?'Waiting for UV and temperature':stressLabels[idx];el('stress-scale').replaceChildren();stressLabels.forEach(function(label,i){var span=document.createElement('span');span.textContent=label;span.style.setProperty('--tone',stressColors[i]);span.className=i===idx?'selected':'';el('stress-scale').appendChild(span);});
+    el('stress-detail').textContent=idx<0?'Both measurements are required.':('UV '+state.uvIndex.toFixed(1)+' · '+state.temperature+'°C. '+(idx===0?'Move to a sheltered, temperature-controlled environment.':idx===1?'Reduce exposure and plan a sheltered break.':'Continue using sun protection outdoors.'));
+    var tips=[state.uvIndex==null?'Start with a UV reading to tailor your outdoor plan.':state.uvIndex>=3?'Your UV reading is '+state.uvIndex.toFixed(1)+': use shade, covering clothing and SPF 30+.':'Your latest UV is low; keep sun protection available as conditions change.',state.temperature==null?'Add ambient temperature for heat and cold guidance.':state.temperature>=32?'Your recorded temperature is hot: take cooling breaks and drink water.':state.temperature<=10?'Your recorded temperature is cold: cover exposed skin and seek shelter if skin becomes painful or numb.':'Your temperature reading is moderate; keep checking when conditions change.',state.allergy?'You listed sensitivities: '+state.allergy+'. Review ingredient labels and discuss uncertain ingredients with a clinician.':'Before adding a skin-care product, review its ingredients and stop use if irritation develops.',(state.skinType==='I'||state.skinType==='II')?'Your selected skin type burns easily. Make protective clothing and shade part of your plan.':'Your selected skin type still needs UV protection; skin tone does not eliminate sun damage.',state.lastSunscreenAt?'Last sunscreen check-in: '+new Date(state.lastSunscreenAt).toLocaleString()+'. Reapply every two hours outdoors and after swimming or sweating.':'Planning '+state.outdoor+' outdoors? Record sunscreen application and take covering clothing with you.'];
+    el('personal-tip-list').replaceChildren();tips.forEach(function(t,i){var card=document.createElement('div');card.className='tip-card';var ico=document.createElement('span');ico.className='tip-ico2';ico.textContent=(i+1);var p=document.createElement('p');p.textContent=t;card.appendChild(ico);card.appendChild(p);el('personal-tip-list').appendChild(card);});
+  }
+  var originalProfile=renderProfile;renderProfile=function(){originalProfile();renderExtras();};
+  var originalRecommendation=renderRecommendation;renderRecommendation=function(){originalRecommendation();renderExtras();};
+
+  // Portable snapshots contain selected user data only, never passwords.
+  var library=extraCard(document.querySelector('.col-side'),'profile-library','<h3>Profile files & sharing</h3><p class="sub" id="active-copy">Your account profile</p><label for="share-scope">Include in export</label><select id="share-scope"><option value="full">Full profile, exposure & chats</option><option value="chats">Shweta chats only</option><option value="exposure">Exposure only</option><option value="profile">Profile details only</option></select><div class="extra-actions"><button id="export-file">Download file</button><button id="share-link">Create sharing link</button><button id="import-file">Upload profile file</button><button id="save-copy">Save current copy</button><button id="return-account">My account profile</button></div><input id="import-input" type="file" accept=".json,application/json" hidden><p class="hint">Files and links contain personal information from your selection. Share only with people you trust. Uploaded files open as separate copies; your sign-in account is unchanged.</p><textarea id="share-output" class="share-output hidden" readonly aria-label="Sharing link"></textarea><p class="extra-status" id="file-status" role="status"></p><div id="file-library"></div>');library.dataset.panel='profile';
+  var accountOwner=null, activeCopy=null, fileVault={};
+  try{fileVault=JSON.parse(localStorage.getItem('skinsense-profile-files-v1')||'{}');}catch(e){}
+  function saveFiles(){localStorage.setItem('skinsense-profile-files-v1',JSON.stringify(fileVault));}
+  function ownerFiles(){return fileVault[accountOwner]||(fileVault[accountOwner]=[]);}
+  var originalSave=saveCurrentUser;saveCurrentUser=function(){if(activeCopy){var copy=ownerFiles().find(function(f){return f.id===activeCopy;});if(copy){copy.data=JSON.parse(JSON.stringify(snapshotState()));copy.updated=new Date().toISOString();try{saveFiles();}catch(e){el('file-status').textContent='Device storage is full. Download your current profile to keep a backup.';}}}else originalSave();};
+  var originalEnter=enterDashboard;enterDashboard=function(){accountOwner=state.email;activeCopy=null;originalEnter();renderLibrary();};
+  function exportPacket(){var scope=el('share-scope').value,full=snapshotState(),data={};if(scope==='full')data=full;else if(scope==='chats')data={chats:full.chats};else if(scope==='exposure')data={readings:full.readings,uvIndex:full.uvIndex,temperature:full.temperature,temperatureSource:full.temperatureSource};else ['name','age','skinType','allergy','outdoor','photo'].forEach(function(k){data[k]=full[k];});return {format:'SkinSense',version:1,scope:scope,created:new Date().toISOString(),data:data};}
+  function downloadPacket(packet,name){var url=URL.createObjectURL(new Blob([JSON.stringify(packet,null,2)],{type:'application/json'})),a=document.createElement('a');a.href=url;a.download=name+'.json';a.click();setTimeout(function(){URL.revokeObjectURL(url);},1000);}
+  el('export-file').onclick=function(){saveCurrentUser();downloadPacket(exportPacket(),'SkinSense-'+el('share-scope').value);};
+  function cleanPacket(packet){if(!packet||packet.format!=='SkinSense'||packet.version!==1||!packet.data||typeof packet.data!=='object')throw Error('Choose a SkinSense version 1 JSON export.');var d=packet.data,out={name:'Imported profile',age:'—',skinType:'III',allergy:'',outdoor:'Not specified',photo:'',uvIndex:null,temperature:null,temperatureSource:'',lastSunscreenAt:null,chats:[],readings:[],alerts:[]};['name','allergy','outdoor'].forEach(function(k){if(typeof d[k]==='string')out[k]=d[k].slice(0,500);});if(['I','II','III','IV','V','VI'].includes(d.skinType))out.skinType=d.skinType;if(Number(d.age)>=1&&Number(d.age)<=120)out.age=Number(d.age);if(typeof d.photo==='string'&&/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(d.photo)&&d.photo.length<250000)out.photo=d.photo;
+    function num(v,min,max){return typeof v==='number'&&Number.isFinite(v)&&v>=min&&v<=max?v:null;}out.uvIndex=num(d.uvIndex,0,30);out.temperature=num(d.temperature,-15,70);out.temperatureSource=['manual','simulator','device'].includes(d.temperatureSource)?d.temperatureSource:'';out.lastSunscreenAt=num(d.lastSunscreenAt,0,Date.now());
+    if(Array.isArray(d.chats))out.chats=d.chats.slice(-500).filter(function(m){return m&&['user','assistant'].includes(m.role)&&typeof m.content==='string';}).map(function(m){return {role:m.role,content:m.content.slice(0,10000)};});
+    if(Array.isArray(d.alerts))out.alerts=d.alerts.slice(-200).filter(function(a){return a&&typeof a.msg==='string'&&Number.isFinite(new Date(a.t).getTime());}).map(function(a){return {t:new Date(a.t),msg:a.msg.slice(0,2000).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'),level:['high','veryhigh','extreme','info'].includes(a.level)?a.level:'info'};});
+    if(Array.isArray(d.readings))out.readings=d.readings.slice(-50000).filter(function(r){return r&&Number.isFinite(new Date(r.t).getTime());}).map(function(r){return {t:new Date(r.t),source:['manual','device','simulator'].includes(r.source)?r.source:'manual',uvIndex:num(r.uvIndex,0,30),temperature:num(r.temperature,-15,70),voltage:num(r.voltage,0,10),intensity:num(r.intensity,0,100),temperatureSource:['manual','device','simulator'].includes(r.temperatureSource)?r.temperatureSource:''};});return out;}
+  function importPacket(packet,label){var clean=cleanPacket(packet),id=crypto.randomUUID();ownerFiles().push({id:id,label:label,data:clean,updated:new Date().toISOString()});saveFiles();renderLibrary();el('file-status').textContent='Imported as a separate copy. Choose Load to open it.';}
+  el('import-file').onclick=function(){el('import-input').click();};el('import-input').onchange=async function(){var file=this.files[0];if(!file)return;try{if(file.size>5000000)throw Error('Use a file smaller than 5 MB.');importPacket(JSON.parse(await file.text()),file.name);}catch(e){el('file-status').textContent='Import failed: '+e.message;}this.value='';};
+  function resetSessionReadings(){stopCamera();if(photoDialog.open)photoDialog.close();sensor.lightOn=false;sensor.lastIntensity=null;sensor.history=[];sensor.lastLoggedCategory=null;lightToggle.checked=false;lightStateLabel.textContent='UV light: OFF';resetDeviceUI();safetyModal.classList.add('hidden');unreadAlerts=0;}
+  function loadCopy(id){saveCurrentUser();resetSessionReadings();activeCopy=id;var record=id?ownerFiles().find(function(f){return f.id===id;}):usersDB[accountOwner];hydrateRecord(record);state.email=accountOwner;renderProfile();renderRecommendation();renderReadings();renderNotifications();renderSunscreenStatus();resetAiChat();renderLibrary();}
+  function renderLibrary(){el('active-copy').textContent=activeCopy?'Editing a separate imported copy · changes save here':'Editing your account profile';el('file-library').replaceChildren();ownerFiles().forEach(function(file){var row=document.createElement('div');row.className='file-entry';var title=document.createElement('strong');title.textContent=file.label;row.appendChild(title);var note=document.createElement('p');note.className='hint';note.textContent=file.data.name+' · saved '+new Date(file.updated).toLocaleString();row.appendChild(note);var buttons=document.createElement('div');buttons.className='extra-actions';[['Load',function(){loadCopy(file.id);}],['Download',function(){downloadPacket({format:'SkinSense',version:1,scope:'full',data:file.data},'SkinSense-profile-copy');}]].forEach(function(pair){var b=document.createElement('button');b.textContent=pair[0];b.onclick=pair[1];buttons.appendChild(b);});row.appendChild(buttons);el('file-library').appendChild(row);});}
+  el('return-account').onclick=function(){loadCopy(null);};el('save-copy').onclick=function(){saveCurrentUser();renderLibrary();el('file-status').textContent='Current profile saved separately.';};
+  el('share-link').onclick=async function(){try{var json=JSON.stringify(exportPacket());if(json.length>12000)throw Error('This selection is too large for a reliable link. Download the file instead.');var bytes=new TextEncoder().encode(json),binary='';bytes.forEach(function(b){binary+=String.fromCharCode(b);});var payload=btoa(binary);var url=new URL(location.href);url.hash='skinsense='+payload;el('share-output').value=url.href;el('share-output').classList.remove('hidden');el('share-output').select();el('file-status').textContent=location.protocol==='file:'?'This local-file link works only where the same HTML file path exists. For sharing between devices, send the JSON file and this app. Hosting the app enables portable web links.':'Copy this link. Anyone with it can read the included snapshot; it cannot be revoked.';if(location.protocol!=='file:'&&navigator.clipboard)await navigator.clipboard.writeText(url.href);}catch(e){el('file-status').textContent=e.message;}};
+  var originalEnterWithLibrary=enterDashboard;enterDashboard=function(){originalEnterWithLibrary();if(location.hash.startsWith('#skinsense=')){try{var hash=location.hash.slice(11);if(hash.length>25000)throw Error('Link too large');var bytes=Uint8Array.from(atob(hash),function(c){return c.charCodeAt(0);});importPacket(JSON.parse(new TextDecoder().decode(bytes)),'Shared snapshot');history.replaceState(null,'',location.pathname+location.search);}catch(e){el('file-status').textContent='Could not import shared link: '+e.message;}}};
+  var originalSummary=localDataSummary;localDataSummary=function(){return originalSummary()+' Ambient temperature: '+(state.temperature==null?'not recorded':state.temperature+' Celsius, '+state.temperatureSource)+'.';};
+  var temperatureHistory=document.createElement('div');el('readings-list').after(temperatureHistory);
+  var previousReadings=renderReadings;renderReadings=function(){previousReadings();temperatureHistory.replaceChildren();var recent=state.readings.filter(function(r){return typeof r.temperature==='number';}).slice(-10).reverse();if(recent.length){var heading=document.createElement('h4');heading.textContent='Temperature & exposure log';temperatureHistory.appendChild(heading);recent.forEach(function(r){var row=document.createElement('div');row.className='reading-row';row.textContent=new Date(r.t).toLocaleString()+' · '+r.temperature+'°C · UV '+(r.uvIndex==null?'not recorded':r.uvIndex.toFixed(1))+' · '+(r.temperatureSource||r.source);temperatureHistory.appendChild(row);});}};
+  var lastTemperatureWarning=null;
+  var previousTemperature=recordTemperature;recordTemperature=function(source){previousTemperature(source);var warning=state.temperature<=0?'cold':state.temperature>=40?'heat':null;if(warning&&lastTemperatureWarning!==warning){showSafetyModal('Extreme temperature exposure',warning==='cold'?'This ambient temperature is freezing or below. Cover exposed skin and move into shelter.':'This ambient temperature is very hot. Move to a cooler environment and reduce exposure.');}lastTemperatureWarning=warning;};
+  // Use one modal action handler so temperature warnings do not log sunscreen.
+  el('safety-action').removeEventListener('click',markSunscreenApplied);
+  el('safety-action').onclick=function(){if(el('safety-title').textContent==='Extreme temperature exposure')safetyModal.classList.add('hidden');else markSunscreenApplied();};
+  var previousSafety=showSafetyModal;showSafetyModal=function(title,message){el('safety-action').textContent=title==='Extreme temperature exposure'?'Understood':'I reapplied';previousSafety(title,message);};
+  el('logout-btn').addEventListener('click',function(){resetSessionReadings();activeCopy=null;state.email='';aiHistory=[];state.chats=[];});
+  window.addEventListener('beforeunload',function(){saveCurrentUser();});
+
+  // ---------- Protection battery: sunscreen % remaining ----------
+  // Baseline follows AAD/FDA guidance: reapply every ~2 hours regardless of
+  // SPF number (SPF affects how much UV is filtered, not how long one
+  // application lasts). We additionally scale the effective window by the
+  // live/simulated UV Index (higher UV drains protection faster) and by how
+  // much product was applied — under-application is a well documented cause
+  // of reduced real-world SPF performance. This is an illustrative model for
+  // habit-building, not a clinical or lab-calibrated measurement.
+  if (typeof state.spf !== 'number') state.spf = 30;
+  if (!state.sunscreenAmount) state.sunscreenAmount = 'full';
+  var _snapshotForBattery = snapshotState;
+  snapshotState = function(){ var s = _snapshotForBattery(); s.spf = state.spf; s.sunscreenAmount = state.sunscreenAmount; return s; };
+  var _hydrateForBattery = hydrateRecord;
+  hydrateRecord = function(record){ _hydrateForBattery(record); if (typeof state.spf !== 'number') state.spf = 30; if (!state.sunscreenAmount) state.sunscreenAmount = 'full'; };
+
+  el('spf-select').value = String(state.spf);
+  el('amount-select').value = state.sunscreenAmount;
+  el('spf-select').onchange = function(){ state.spf = Number(this.value); saveCurrentUser(); renderProtectionBattery(); };
+  el('amount-select').onchange = function(){ state.sunscreenAmount = this.value; saveCurrentUser(); renderProtectionBattery(); };
+  document.getElementById('signup-form').addEventListener('submit', function(){ state.spf = 30; state.sunscreenAmount = 'full'; el('spf-select').value = '30'; el('amount-select').value = 'full'; });
+
+  function protectionCeiling(){ return state.sunscreenAmount === 'light' ? 70 : 100; }
+  function protectionMinutesTotal(){
+    var baseMinutes = 120, uvRef = 6;
+    var uv = (state.uvIndex == null) ? uvRef : Math.max(state.uvIndex, 1);
+    var uvScaled = baseMinutes * (uvRef / uv);
+    var amountFactor = state.sunscreenAmount === 'light' ? 0.5 : 1;
+    // Heat/sweat accelerates real-world washoff; illustrative, not a lab constant.
+    var tempFactor = (typeof state.temperature === 'number' && state.temperature >= 32) ? 0.8 : 1;
+    // Cumulative session stress trims the window further at higher recent load.
+    var stressFactor = 1 - Math.min(typeof stressScore === 'number' ? stressScore : 0, 100) * 0.0015;
+    return Math.max(15, uvScaled * amountFactor * tempFactor * stressFactor);
+  }
+  function protectionPercent(){
+    if (!state.lastSunscreenAt) return null;
+    var elapsedMin = (Date.now() - state.lastSunscreenAt) / 60000;
+    var ceiling = protectionCeiling(), total = protectionMinutesTotal();
+    return Math.max(0, Math.min(ceiling, ceiling * (1 - elapsedMin / total)));
+  }
+
+  var lowBatteryAlertedFor = null;
+  function renderProtectionBattery(){
+    var fill = el('battery-fill'), pctEl = el('battery-pct'), subEl = el('battery-sub');
+    var pct = protectionPercent();
+    if (pct === null){
+      fill.style.width = '0%'; fill.className = 'battery-fill';
+      pctEl.textContent = 'No sunscreen logged';
+      subEl.textContent = 'Log your first application to start tracking protection.';
+      return;
+    }
+    fill.style.width = Math.round(pct) + '%';
+    fill.className = 'battery-fill' + (pct <= 20 ? ' low' : pct <= 50 ? ' mid' : '');
+    pctEl.textContent = Math.round(pct) + '% protection remaining';
+    var uvNote = state.uvIndex == null ? '' : ' at UV ' + state.uvIndex.toFixed(1);
+    if (pct <= 0) subEl.textContent = 'Depleted' + uvNote + ' — reapply now.';
+    else if (pct <= 20) subEl.textContent = 'Running low' + uvNote + ' — reapply soon.';
+    else subEl.textContent = 'Draining' + uvNote + ' since your last check-in.';
+
+    if (pct <= 20 && lowBatteryAlertedFor !== state.lastSunscreenAt){
+      lowBatteryAlertedFor = state.lastSunscreenAt;
+      pushAlert('Sunscreen protection is down to ' + Math.round(pct) + '% — reapply soon.', 'high');
+    }
+    if (pct > 20) lowBatteryAlertedFor = null;
+  }
+  var _renderSunscreenForBattery = renderSunscreenStatus;
+  renderSunscreenStatus = function(){ _renderSunscreenForBattery(); renderProtectionBattery(); };
+  setInterval(renderProtectionBattery, 15000);
+
+  // ---------- Tie the paired-device panel to the same temperature reading ----------
+  var _updateConnectedReadoutWithTemp = updateConnectedReadout;
+  updateConnectedReadout = function(){
+    _updateConnectedReadoutWithTemp();
+    var row = document.getElementById('live-temp-row');
+    if (row) row.querySelector('.v').textContent = state.temperature == null ? 'No data yet' : state.temperature + '°C';
+  };
+
+  // ---------- Password visibility toggle ----------
+  var eyeOpenSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>';
+  var eyeOffSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.94 10.94 0 0112 20c-7 0-11-8-11-8a20.3 20.3 0 015.06-5.94M9.9 4.24A10.94 10.94 0 0112 4c7 0 11 8 11 8a20.3 20.3 0 01-2.44 3.34M14.12 14.12a3 3 0 11-4.24-4.24"/><path d="M1 1l22 22"/></svg>';
+  document.querySelectorAll('.pw-toggle').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      var input = document.getElementById(btn.dataset.pwFor);
+      var showing = input.type === 'text';
+      input.type = showing ? 'password' : 'text';
+      btn.title = showing ? 'Show password' : 'Hide password';
+      btn.setAttribute('aria-label', btn.title);
+      btn.innerHTML = showing ? eyeOpenSvg : eyeOffSvg;
+    });
+  });
+
+  // ---------- Email format feedback (native required+type=email already
+  // blocks a malformed submit; this just gives a clearer inline message) ----------
+  var emailLiveRe = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+  el('su-email').addEventListener('input', function(){
+    var hint = el('su-email-hint');
+    if (!this.value) { hint.textContent = ''; return; }
+    if (emailLiveRe.test(this.value.trim())) { hint.textContent = 'Looks like a valid address.'; hint.style.color = 'var(--good)'; }
+    else { hint.textContent = "That doesn't look like a complete email address yet."; hint.style.color = 'var(--danger)'; }
+  });
+
+  // ---------- Email "confirmation" step ----------
+  // Important, honest limitation: this file has no server, so it cannot
+  // actually deliver email. Real delivery needs a backend (e.g. an API route
+  // that calls a transactional email provider) — never call such a provider
+  // directly from browser JS, since that would expose its API key to anyone
+  // viewing the page source. Instead we generate a real one-time code and
+  // show it in the modal itself, so the flow still catches typos and gets a
+  // deliberate confirmation step, without pretending mail was sent.
+  var pendingVerification = false;
+  var currentVerifyCode = null;
+  var verifyModal = document.getElementById('verify-modal');
+
+  function showVerifyModal(){
+    currentVerifyCode = String(Math.floor(100000 + Math.random() * 900000));
+    document.getElementById('verify-email-addr').textContent = state.email;
+    document.getElementById('verify-code-display').textContent = currentVerifyCode;
+    document.getElementById('verify-code-input').value = '';
+    document.getElementById('verify-error').textContent = '';
+    verifyModal.classList.remove('hidden');
+    document.getElementById('verify-code-input').focus();
+  }
+  document.getElementById('verify-confirm-btn').addEventListener('click', function(){
+    var typed = document.getElementById('verify-code-input').value.trim();
+    if (typed && typed === currentVerifyCode){
+      pendingVerification = false;
+      if (usersDB[state.email]) { usersDB[state.email].emailVerified = true; persistVault(); }
+      verifyModal.classList.add('hidden');
+      enterDashboard();
+    } else {
+      document.getElementById('verify-error').textContent = "That code doesn't match — check the digits above and try again.";
+    }
+  });
+  document.getElementById('verify-back-btn').addEventListener('click', function(){
+    verifyModal.classList.add('hidden');
+    pendingVerification = false;
+    if (state.email && usersDB[state.email] && !usersDB[state.email].emailVerified){ delete usersDB[state.email]; persistVault(); }
+    setTab('signup');
+  });
+  var _enterDashboardForVerify = enterDashboard;
+  enterDashboard = function(){
+    if (pendingVerification){ showVerifyModal(); return; }
+    _enterDashboardForVerify();
+  };
+  // Runs synchronously during the same submit dispatch, before the original
+  // async handler resumes after its await — see note in chat about ordering.
+  document.getElementById('signup-form').addEventListener('submit', function(){ pendingVerification = true; });
+  document.getElementById('signin-form').addEventListener('submit', function(){ pendingVerification = false; });
+
+  // ---------- My climate: real local weather via Open-Meteo (no key needed) ----------
+  var climateData = null, lastClimateCoords = null;
+  function fetchClimate(lat, lon, label){
+    lastClimateCoords = {lat:lat, lon:lon, label:label};
+    var statusEl = el('climate-status');
+    statusEl.textContent = 'Fetching real weather data…';
+    fetch('https://api.open-meteo.com/v1/forecast?latitude=' + lat + '&longitude=' + lon + '&hourly=temperature_2m,uv_index&timezone=auto')
+      .then(function(r){ if (!r.ok) throw new Error('weather service error'); return r.json(); })
+      .then(function(data){
+        var times = data.hourly.time, now = new Date(), idx = 0, best = Infinity;
+        times.forEach(function(t, i){ var diff = Math.abs(new Date(t) - now); if (diff < best){ best = diff; idx = i; } });
+        climateData = { uv: data.hourly.uv_index[idx], temp: data.hourly.temperature_2m[idx], label: label, time: times[idx] };
+        renderClimateResult();
+      })
+      .catch(function(){ statusEl.textContent = 'Could not fetch weather — check your connection and try again.'; });
+  }
+  function renderClimateResult(){
+    el('climate-idle').classList.add('hidden');
+    el('climate-result').classList.remove('hidden');
+    el('climate-place').textContent = climateData.label;
+    el('climate-updated').textContent = ' · As of ' + new Date(climateData.time).toLocaleString([], {hour:'numeric', minute:'2-digit', month:'short', day:'numeric'}) + ' (Open-Meteo)';
+    el('climate-uv').textContent = climateData.uv.toFixed(1);
+    el('climate-temp').textContent = climateData.temp.toFixed(1) + '°C';
+    var cat = uvCategory(climateData.uv);
+    el('climate-recommendation').textContent = 'Local UV Index is ' + climateData.uv.toFixed(1) + ' (' + cat.label + ') at ' + climateData.temp.toFixed(1) + '°C. ' +
+      (climateData.uv >= 6 ? 'Use SPF 30+, seek shade in peak hours, and reapply every two hours.' : climateData.uv >= 3 ? 'Moderate UV — sunscreen is still worthwhile for extended time outdoors.' : 'Low UV right now — normal precautions are enough.');
+  }
+  el('climate-locate-btn').addEventListener('click', function(){
+    var statusEl = el('climate-status');
+    if (!navigator.geolocation){ statusEl.textContent = 'Geolocation is not supported in this browser.'; return; }
+    statusEl.textContent = 'Requesting location permission…';
+    navigator.geolocation.getCurrentPosition(function(pos){
+      fetchClimate(pos.coords.latitude, pos.coords.longitude, 'Your location');
+    }, function(err){
+      statusEl.textContent = 'Location permission was denied or unavailable (' + err.message + '). Try searching a city instead.';
+    }, { timeout: 10000 });
+  });
+  el('climate-city-btn').addEventListener('click', function(){
+    var city = el('climate-city-input').value.trim();
+    var statusEl = el('climate-status');
+    if (!city){ statusEl.textContent = 'Type a city name first.'; return; }
+    statusEl.textContent = 'Looking up ' + city + '…';
+    fetch('https://geocoding-api.open-meteo.com/v1/search?name=' + encodeURIComponent(city) + '&count=1')
+      .then(function(r){ return r.json(); })
+      .then(function(data){
+        if (!data.results || !data.results.length){ statusEl.textContent = 'Could not find that city.'; return; }
+        var place = data.results[0];
+        fetchClimate(place.latitude, place.longitude, place.name + (place.country ? ', ' + place.country : ''));
+      })
+      .catch(function(){ statusEl.textContent = 'City lookup failed — check your connection and try again.'; });
+  });
+  el('climate-refresh-btn').addEventListener('click', function(){ if (lastClimateCoords) fetchClimate(lastClimateCoords.lat, lastClimateCoords.lon, lastClimateCoords.label); });
+  el('climate-apply-btn').addEventListener('click', function(){
+    if (!climateData) return;
+    state.uvIndex = climateData.uv;
+    state.temperature = climateData.temp;
+    state.temperatureSource = 'location';
+    state.readings.push({t:new Date(), source:'location', uvIndex:climateData.uv, temperature:climateData.temp, temperatureSource:'location'});
+    renderRecommendation(); renderReadings(); renderExtras(); saveCurrentUser();
+    pushAlert('Local reading applied: UV ' + climateData.uv.toFixed(1) + ', ' + climateData.temp.toFixed(1) + '°C (Open-Meteo).', 'info');
+  });
+
+  // ---------- Thermal & cumulative stress monitor ----------
+  // Builds up while stressIndex() reports a worse instantaneous rating, eases
+  // off otherwise. Illustrative session-level indicator, not a clinical score.
+  var stressScore = 0;
+  function tickStress(){
+    var idx = stressIndex(state.uvIndex, state.temperature);
+    var target = idx < 0 ? 0 : (4 - idx) * 25;
+    if (target > stressScore) stressScore = Math.min(100, stressScore + (target - stressScore) * 0.35);
+    else stressScore = Math.max(0, stressScore - (stressScore - target) * 0.12);
+    renderStressMonitor();
+  }
+  function renderStressMonitor(){
+    var fill = el('stress-fill'), pctEl = el('stress-pct'), subEl = el('stress-sub');
+    if (!fill) return;
+    var pct = Math.round(stressScore);
+    fill.style.width = pct + '%';
+    fill.className = 'battery-fill' + (pct >= 70 ? ' low' : pct >= 40 ? ' mid' : '');
+    var label = pct >= 70 ? 'High' : pct >= 40 ? 'Moderate' : pct >= 15 ? 'Low' : 'Minimal';
+    pctEl.textContent = pct + '% — ' + label;
+    subEl.textContent = (state.uvIndex == null && state.temperature == null)
+      ? 'Builds up during high UV or heat exposure, and eases off over time once conditions improve.'
+      : 'From your latest UV (' + (state.uvIndex == null ? '—' : state.uvIndex.toFixed(1)) + ') and temperature (' + (state.temperature == null ? '—' : state.temperature + '°C') + ').';
+  }
+  setInterval(tickStress, 15000);
+  tickStress();
+
+  // ---------- AI: personalization boost (battery %, stress score, climate) ----------
+  var _summaryForExtras = localDataSummary;
+  localDataSummary = function(){
+    var base = _summaryForExtras();
+    var extra = [];
+    var pct = protectionPercent();
+    extra.push(pct === null ? 'No sunscreen currently logged.' : 'Sunscreen protection remaining: ' + Math.round(pct) + '%.');
+    extra.push('Cumulative session stress score: ' + Math.round(stressScore) + '/100.');
+    if (climateData) extra.push('Last fetched local weather (' + climateData.label + '): UV ' + climateData.uv.toFixed(1) + ', ' + climateData.temp.toFixed(1) + '°C.');
+    return base + ' ' + extra.join(' ');
+  };
+
+  // ---------- AI: playful, clickable tip popups ----------
+  var aiCatchphrases = [
+    { text: "Psst — your skin called. It wants sunscreen. ☀️", tip: "Apply sunscreen 15–20 minutes before heading out so it has time to bind." },
+    { text: "Warning: UV rays don't care about your plans.", tip: "Check the UV Index before long outdoor plans, not after." },
+    { text: "Shade: nature's pause button for sun damage.", tip: "Seeking shade for 10–15 minutes an hour can meaningfully cut exposure." },
+    { text: "Reapplying sunscreen is cheaper than a dermatologist bill.", tip: "Reapply every 2 hours outdoors, sooner after swimming or sweating." },
+    { text: "Hydration station, now boarding.", tip: "Heat stress and dehydration often show up together — drink water outdoors." },
+    { text: "Your future skin thanks you for the hat.", tip: "A wide-brim hat blocks UV that sunscreen alone often misses on the face." }
+  ];
+  var aiToastEl = null;
+  function dismissAiToast(){ if (aiToastEl){ aiToastEl.remove(); aiToastEl = null; } }
+  function showAiToast(){
+    var dash = document.getElementById('view-dashboard');
+    if (!dash || dash.classList.contains('hidden')) return;
+    if (!aiPanel.classList.contains('hidden')) return;
+    if (aiToastEl) return;
+    var pick = aiCatchphrases[Math.floor(Math.random() * aiCatchphrases.length)];
+    aiToastEl = document.createElement('div');
+    aiToastEl.className = 'ai-toast';
+    aiToastEl.innerHTML = '<strong>' + pick.text + '</strong><span>' + pick.tip + '</span>';
+    aiToastEl.addEventListener('click', function(){
+      aiPanel.classList.remove('hidden');
+      addAiBubble('assistant', pick.tip);
+      dismissAiToast();
+    });
+    document.body.appendChild(aiToastEl);
+    setTimeout(dismissAiToast, 9000);
+  }
+  setTimeout(showAiToast, 20000);
+  setInterval(showAiToast, 75000);
+
+  // ---------- AI: let Shweta adjust the app from what the user describes ----------
+  // Anthropic's real client-executed tool-use requires storing structured
+  // content blocks in chat history, which would break the plain-string chat
+  // model this file already persists/exports/imports. Instead, the system
+  // prompt asks the model to append one machine-readable marker line — parsed
+  // and stripped here — so the rest of the chat storage stays untouched.
+  function applySkinSenseUpdateMarker(text){
+    var m = text.match(/<!--SKINSENSE_UPDATE\s*([\s\S]*?)-->/);
+    if (!m) return null;
+    var payload;
+    try { payload = JSON.parse(m[1]); } catch(e){ return null; }
+    var changed = [];
+    if (typeof payload.spf === 'number' && payload.spf > 0){ state.spf = payload.spf; el('spf-select').value = [15,30,50,70].indexOf(payload.spf) !== -1 ? String(payload.spf) : el('spf-select').value; changed.push('SPF'); }
+    if (payload.amount_applied === 'full' || payload.amount_applied === 'light'){ state.sunscreenAmount = payload.amount_applied; el('amount-select').value = payload.amount_applied; changed.push('application amount'); }
+    if (payload.sunscreen_applied === true){ state.lastSunscreenAt = Date.now(); changed.push('sunscreen check-in'); }
+    if (typeof payload.outdoor_minutes === 'number' && payload.outdoor_minutes > 0){
+      state.outdoor = payload.outdoor_minutes <= 30 ? 'Under 30 minutes' : payload.outdoor_minutes <= 120 ? '30 minutes – 2 hours' : payload.outdoor_minutes <= 240 ? '2 – 4 hours' : 'Most of the day';
+      changed.push('typical time outdoors');
+    }
+    if (!changed.length) return null;
+    saveCurrentUser(); renderProfile(); renderRecommendation(); renderSunscreenStatus();
+    return payload.summary || ('Updated: ' + changed.join(', ') + '.');
+  }
+
+  sendToAssistant = async function(userText){
+    aiHistory.push({role:'user', content: userText});
+    var chatOwner = state.email, chatCopy = activeCopy, chatBuffer = aiHistory;
+    state.chats = chatBuffer; saveCurrentUser();
+    var thinkingBubble = addAiBubble('assistant', 'Thinking…', 'thinking');
+
+    var systemPrompt = 'You are Shweta, the SkinSense skin guide, embedded in a UV-exposure and skin-health companion app. ' +
+      'You have access to the user\'s locally-saved profile and session data below — use it to personalize your answer when relevant, but do not invent data that isn\'t given. ' +
+      'You can also use web search for things that need current information (weather, UV forecasts, product facts). ' +
+      'Be concise, warm, and practical. Do not give medical diagnoses; suggest seeing a dermatologist for anything that sounds like a skin condition. ' +
+      'If the user describes something from their day that should update the app — applying sunscreen, an SPF or product they used, how much they applied, or time spent outdoors — extract that and append exactly one line at the very end of your reply, on its own line, in this exact format and nothing else on that line: ' +
+      '<!--SKINSENSE_UPDATE {"sunscreen_applied":true,"spf":50,"amount_applied":"full","outdoor_minutes":90,"summary":"one short sentence"} --> (include only the fields actually mentioned; omit the whole marker line if nothing warrants an update). Never show raw JSON anywhere else in your reply. ' +
+      'Local data:\n' + localDataSummary();
+
+    try {
+      var response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-6",
+          max_tokens: 1000,
+          system: systemPrompt,
+          messages: aiHistory,
+          tools: [{ type: "web_search_20250305", name: "web_search" }]
+        })
+      });
+      var data = await response.json();
+      var text = (data.content || [])
+        .map(function(block){ return block.type === 'text' ? block.text : ''; })
+        .filter(Boolean)
+        .join('\n')
+        .trim();
+      if (!text) text = "I couldn't find a good answer for that just now — could you rephrase?";
+
+      var updateSummary = applySkinSenseUpdateMarker(text);
+      text = text.replace(/<!--SKINSENSE_UPDATE[\s\S]*?-->/, '').trim();
+
+      thinkingBubble.remove();
+      chatBuffer.push({role:'assistant', content: text});
+      if (chatOwner === state.email && chatCopy === activeCopy) {
+        addAiBubble('assistant', text);
+        if (updateSummary) addAiBubble('assistant', '✓ ' + updateSummary, 'update-note');
+        state.chats = chatBuffer; saveCurrentUser();
+      }
+      else if (chatCopy) { var destination = (fileVault[chatOwner] || []).find(function(f){ return f.id === chatCopy; }); if (destination){ destination.data.chats = chatBuffer; saveFiles(); } }
+      else if (usersDB[chatOwner]) { usersDB[chatOwner].data.chats = chatBuffer; persistVault(); }
+    } catch (err){
+      thinkingBubble.remove();
+      if (chatOwner === state.email && chatCopy === activeCopy) addAiBubble('assistant', "I couldn't reach the assistant service just now. Please try again in a moment.");
+    }
+  };
+})();
+</script>
+</body>
+</html>
